@@ -1,0 +1,303 @@
+import cv2
+import numpy as np
+from google.colab.patches import cv2_imshow
+
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+img = cv2.imread('./content/veer-123154948.jpg')
+
+if img is None:
+    print('錯誤：無法讀取圖片')
+else:
+    imgDisplay = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 1. 找人的輪廓
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 50, 150)
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) > 0:
+        person_cnt = max(contours, key=cv2.contourArea)
+        px, py, pw, ph = cv2.boundingRect(person_cnt)
+        cv2.rectangle(imgDisplay, (px, py), (px+pw, py+ph), (255, 255, 0), 2)
+
+        person_roi_gray = gray[py:py+ph, px:px+pw]
+        person_roi_color = imgDisplay[py:py+ph, px:px+pw]
+
+        # 2. 在人的範圍內找臉
+        faces = face_cascade.detectMultiScale(person_roi_gray, 1.1, 5)
+
+        for (fx, fy, fw, fh) in faces:
+            cv2.rectangle(person_roi_color, (fx, fy), (fx+fw, fy+fh), (255, 0, 0), 2)
+
+            # 3. 嚴格限制眼睛搜尋區域 (臉部高度的 20% 到 50%)
+            eye_y_start = fy + int(fh * 0.2)
+            eye_y_end = fy + int(fh * 0.5)
+            eye_roi_gray = person_roi_gray[eye_y_start:eye_y_end, fx:fx+fw]
+            eye_roi_color = person_roi_color[eye_y_start - fy : eye_y_end - fy, fx:fx+fw]
+
+            eye_blurred = cv2.medianBlur(eye_roi_gray, 7)
+            circles = cv2.HoughCircles(
+                eye_blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=fw/4,
+                param1=50, param2=20, minRadius=5, maxRadius=int(fw/8)
+            )
+
+            if circles is not None:
+                circles = np.round(circles[0, :]).astype('int')
+                scored_circles = []
+                for (cx, cy, r) in circles:
+                    if cx-r < 0 or cy-r < 0 or cx+r >= eye_roi_gray.shape[1] or cy+r >= eye_roi_gray.shape[0]:
+                        continue
+                    roi = eye_roi_gray[cy-r:cy+r, cx-r:cx+r]
+                    if roi.size == 0: continue
+                    avg_brightness = np.mean(roi)
+                    scored_circles.append((cx, cy, r, avg_brightness))
+
+                # 排序取最暗的兩個
+                scored_circles = sorted(scored_circles, key=lambda x: x[3])[:2]
+
+                for (cx, cy, r, score) in scored_circles:
+                    cv2.circle(eye_roi_color, (cx, cy), r, (0, 0, 255), 3)
+                    cv2.circle(eye_roi_color, (cx, cy), 2, (255, 255, 255), -1)
+
+        print('已優化區域限制，避開嘴巴區域。')
+    else:
+        print('未能找到明顯的人體輪廓。')
+
+    cv2_imshow(cv2.resize(imgDisplay, (800, 600)))
+    cv2.destroyAllWindows()
+import cv2
+import numpy as np
+from google.colab.patches import cv2_imshow
+
+# 載入分類器
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def detect_pupils(img_path):
+    img = cv2.imread(img_path)
+    if img is None: return print('無法讀取圖片')
+
+    img_display = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # 1. 偵測臉部
+    faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+
+    for (x, y, w, h) in faces:
+        # 2. 定義眼睛精確區域 (臉部高度的 22% 到 45%)
+        eye_roi_y_start = y + int(h * 0.22)
+        eye_roi_y_end = y + int(h * 0.45)
+        roi_gray = gray[eye_roi_y_start:eye_roi_y_end, x:x+w]
+        roi_color = img_display[eye_roi_y_start:eye_roi_y_end, x:x+w]
+
+        # 3. 強化眼睛區域對比度 (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        roi_enhanced = clahe.apply(roi_gray)
+
+        # 4. 雙邊濾波保留邊緣並去噪
+        blurred = cv2.bilateralFilter(roi_enhanced, 9, 75, 75)
+
+        # 5. 霍夫圓偵測
+        circles = cv2.HoughCircles(
+            blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=w/4,
+            param1=50, param2=20, minRadius=int(w/40), maxRadius=int(w/10)
+        )
+
+        if circles is not None:
+            circles = np.round(circles[0, :]).astype('int')
+            # 依照圓內平均亮度排序，取最暗的兩個
+            scored = []
+            for (cx, cy, r) in circles:
+                if cx-r < 0 or cy-r < 0 or cx+r >= roi_gray.shape[1] or cy+r >= roi_gray.shape[0]: continue
+                avg_val = np.mean(roi_gray[cy-r:cy+r, cx-r:cx+r])
+                scored.append((cx, cy, r, avg_val))
+
+            scored = sorted(scored, key=lambda x: x[3])[:2]
+
+            for (cx, cy, r, score) in scored:
+                # 6. 二次修正中心：尋找圓內的絕對最暗點
+                eye_patch = blurred[max(0,cy-r):min(roi_gray.shape[0],cy+r), max(0,cx-r):min(roi_gray.shape[1],cx+r)]
+                _, _, min_loc, _ = cv2.minMaxLoc(eye_patch)
+                correct_cx = cx - r + min_loc[0]
+                correct_cy = cy - r + min_loc[1]
+
+                # 標記瞳孔 (紅圈 + 白心)
+                cv2.circle(roi_color, (correct_cx, correct_cy), r, (0, 0, 255), 3)
+                cv2.circle(roi_color, (correct_cx, correct_cy), 2, (255, 255, 255), -1)
+
+    cv2_imshow(cv2.resize(img_display, (800, 600)))
+
+detect_pupils('/content/2626e1ace21d446f48561b318e610f31ea80210d.jpeg')
+import cv2
+import numpy as np
+from google.colab.patches import cv2_imshow
+
+# Load cascade
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+def detect_pupils_opencv_enhanced():
+    img = cv2.imread(img_path)
+    if img is None: return print('無法讀取圖片')
+
+    img_display = img.copy()
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Define ROI color (for visualization)
+    roi_color_display = img_display.copy()
+
+    # 1. Detect faces
+    faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+
+    results = []
+
+    for (x, y, w, h) in faces:
+        # Define accurate eye region (widen to include edges)
+        eye_roi_y_start = y + int(h * 0.22)
+        eye_roi_y_end = y + int(h * 0.45)
+        # Sligthly wider ROI
+        x_roi_start = max(0, x - int(w*0.05))
+        x_roi_end = min(gray.shape[1], x + w + int(w*0.05))
+        w_roi = x_roi_end - x_roi_start
+
+        roi_gray = gray[eye_roi_y_start:eye_roi_y_end, x_roi_start:x_roi_end]
+        roi_enhanced_display = roi_color_display[eye_roi_y_start:eye_roi_y_end, x_roi_start:x_roi_end]
+
+        # 2. Enhance contrast with CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        roi_enhanced = clahe.apply(roi_gray)
+
+        # 3. Denoise while preserving edges
+        blurred = cv2.bilateralFilter(roi_enhanced, 9, 75, 75)
+
+        # 4. Hough Circle detection with relaxed parameters
+        # minDist = w/10 (tighter for small objects), param2=15 (lower to find more candidate circles)
+        circles = cv2.HoughCircles(
+            blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=int(w/10),
+            param1=50, param2=15, minRadius=int(w/40), maxRadius=int(w/10)
+        )
+
+        all_valid_candidates = []
+        if circles is not None:
+            circles = np.round(circles[0, :]).astype('int')
+
+            # Filter and sort circles: must be dark, not at the very bottom
+            for (cx, cy, r) in circles:
+                if cx-r < 0 or cy-r < 0 or cx+r >= roi_gray.shape[1] or cy+r >= roi_gray.shape[0]: continue
+                # filter out ones in the very bottom/edges of ROI to avoid ears
+                if cy > roi_gray.shape[0] * 0.8: continue
+
+                avg_val = np.mean(blurred[cy-r:cy+r, cx-r:cx+r])
+                # Brightness filter (pupils are very dark)
+                if avg_val < 50:
+                    all_valid_candidates.append((cx, cy, r, avg_val))
+
+        # Sort all filtered circles by brightness
+        all_valid_candidates = sorted(all_valid_candidates, key=lambda x: x[3])
+
+        # 5. Search for the best Pair of candidates using geometric constraints
+        best_pair = None
+        if len(all_valid_candidates) >= 2:
+            for i in range(len(all_valid_candidates)):
+                for j in range(i + 1, len(all_valid_candidates)):
+                    p1 = all_valid_candidates[i]
+                    p2 = all_valid_candidates[j]
+
+                    y_delta = abs(p1[1] - p2[1])
+                    x_dist = abs(p1[0] - p2[0])
+
+                    # Geometric constraints: horizontally aligned, reasonable distance
+                    # w/3.5 < X_dist < w/1.5 is reasonable face proportion
+                    # Y_delta < 15% of ROI height
+                    if y_delta < roi_gray.shape[0] * 0.15 and w/3.5 < x_dist < w/1.5:
+                        # Success: found a pair. Use the most horizontally aligned one as best
+                        best_pair = (p1, p2)
+                        break
+                if best_pair: break
+
+        found_pupils_coordinates_rel_roi = []
+
+        if best_pair:
+            # Step A: Found a pair, store and break
+            found_pupils_coordinates_rel_roi = [(best_pair[0][0], best_pair[0][1], best_pair[0][2]),
+                                                (best_pair[1][0], best_pair[1][1], best_pair[1][2])]
+
+        elif len(all_valid_candidates) > 0:
+            # Step B: Fallback (Prediction and Correction) - only found one or bad pairs
+            # Assume the single clearest (darkest) eye as e1
+            e1 = all_valid_candidates[0]
+
+            # Predict location of e2 symmetrically around facial center
+            face_center_x_abs = x + w/2
+            predicted_e2x_abs = 2 * face_center_x_abs - (x_roi_start + e1[0])
+
+            # Convert back to relative ROI coordinates
+            rel_predicted_x = int(predicted_e2x_abs - x_roi_start)
+            rel_predicted_y = e1[1] # assume level eyes
+            pr = e1[2] # assume similar size
+
+            # Define a small refined patch around the predicted e2
+            patch_r = int(pr * 1.5)
+            y_p_start = max(0, rel_predicted_y - patch_r)
+            y_p_end = min(roi_gray.shape[0], rel_predicted_y + patch_r)
+            x_p_start = max(0, rel_predicted_x - patch_r)
+            x_p_end = min(roi_gray.shape[1], rel_predicted_x + patch_r)
+
+            eye_patch = blurred[y_p_start:y_p_end, x_p_start:x_p_end]
+            if eye_patch.size > 0:
+                # Same minMaxLoc logic: find true darkest spot (corrected obscured pupil)
+                _, _, min_loc, _ = cv2.minMaxLoc(eye_patch)
+                correct_e2x = x_p_start + min_loc[0]
+                correct_e2y = y_p_start + min_loc[1]
+
+                found_pupils_coordinates_rel_roi = [(e1[0], e1[1], e1[2]),
+                                                   (correct_e2x, correct_e2y, pr)]
+            else:
+                # Fallback to pure predicted
+                found_pupils_coordinates_rel_roi = [(e1[0], e1[1], e1[2]),
+                                                   (rel_predicted_x, rel_predicted_y, pr)]
+        else:
+            # Found no valid candidate
+            pass
+
+        # 6. Apply final center correction to all found pupils (using refined patches)
+        results_in_image_coords = []
+        if len(found_pupils_coordinates_rel_roi) == 2:
+            for idx, (cx, cy, r) in enumerate(found_pupils_coordinates_rel_roi):
+                if idx == 1 and best_pair is None: # Prediction for missing e2 is already corrected
+                    correct_cx = cx
+                    correct_cy = cy
+                else:
+                    y_patch_start = max(0,cy-r)
+                    y_patch_end = min(roi_gray.shape[0],cy+r)
+                    x_patch_start = max(0,cx-r)
+                    x_patch_end = min(roi_gray.shape[1],cx+r)
+                    eye_patch = blurred[y_patch_start:y_patch_end, x_patch_start:x_patch_end]
+
+                    if eye_patch.size > 0:
+                        _, _, min_loc, _ = cv2.minMaxLoc(eye_patch)
+                        correct_cx = x_patch_start + min_loc[0]
+                        correct_cy = y_patch_start + min_loc[1]
+                    else:
+                        correct_cx = cx
+                        correct_cy = cy
+
+                # Absolute coordinates in original image
+                abs_e_x = x_roi_start + correct_cx
+                abs_e_y = eye_roi_y_start + correct_cy
+                results_in_image_coords.append((abs_e_x, abs_e_y, r))
+
+        # Draw final results in the large image
+        for (abs_cx, abs_cy, r) in results_in_image_coords:
+            # Draw pupils (red ring + white center)
+            cv2.circle(img_display, (abs_cx, abs_cy), r, (0, 0, 255), 3)
+            cv2.circle(img_display, (abs_cx, abs_cy), 2, (255, 255, 255), -1)
+
+        results.append((x, y, w, h, results_in_image_coords))
+
+    cv2_imshow(cv2.resize(img_display, (800, 600)))
+    return results
+
+# Example Usage
+detect_pupils_opencv_enhanced('/content/2626e1ace21d446f48561b318e610f31ea80210d.jpeg')
+
